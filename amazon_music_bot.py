@@ -51,49 +51,60 @@ class AmazonMusicDownloader:
         return match.group(1)
 
     def get_url_type(self, url: str) -> str:
-        if "/tracks/" in url:
-            return "track"
-        elif "/albums/" in url:
-            return "album"
-        elif "/playlists/" in url:
-            return "playlist"
+        if "/tracks/" in url: return "track"
+        elif "/albums/" in url: return "album"
+        elif "/playlists/" in url: return "playlist"
         return "unknown"
 
     def scrape_amazon_page(self, amazon_url: str) -> dict:
-        """Basic scrape (often fails due to JS)"""
+        """Fixed parser for 2026 Amazon Music title format"""
         result = {"title": "", "artist": "", "album": "", "thumbnail": ""}
         try:
             r = self.session.get(amazon_url, timeout=15)
             html = r.text
 
-            # og:meta
+            # <title> tag - this is the only reliable data now
+            title_tag = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
+            if title_tag:
+                text = title_tag.group(1).strip()
+                if " on Amazon Music" in text:
+                    text = text.split(" on Amazon Music")[0].strip()
+
+                # New format: "Attention song by Charlie Puth from Voicenotes"
+                if " song by " in text.lower():
+                    parts = re.split(r'\s+song by\s+', text, 1, re.IGNORECASE)
+                    result["title"] = parts[0].strip()
+                    if len(parts) == 2:
+                        remaining = parts[1]
+                        if " from " in remaining.lower():
+                            sub = re.split(r'\s+from\s+', remaining, 1, re.IGNORECASE)
+                            result["artist"] = sub[0].strip()
+                            result["album"] = sub[1].strip() if len(sub) > 1 else ""
+                        else:
+                            result["artist"] = remaining.strip()
+
+                # Fallback for albums/playlists: "AlbumName by ArtistName"
+                elif " by " in text.lower():
+                    parts = re.split(r'\s+by\s+', text, 1, re.IGNORECASE)
+                    result["title"] = parts[0].strip()
+                    result["artist"] = parts[1].strip() if len(parts) > 1 else ""
+
+            # og:meta backup (rarely present now)
             for attr in ("property", "name"):
                 for tag, key in [("og:title", "title"), ("og:image", "thumbnail"), ("music:musician", "artist")]:
                     m = re.search(rf'<meta[^>]+{attr}=["\']{re.escape(tag)}["\'][^>]*content=["\'](.*?)["\']', html, re.IGNORECASE)
                     if m and not result.get(key):
                         result[key] = m.group(1).strip()
 
-            # <title> tag fallback
-            title_tag = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
-            if title_tag and not result["title"]:
-                text = title_tag.group(1).strip()
-                if " on Amazon Music" in text:
-                    text = text.split(" on Amazon Music")[0].strip()
-                if " by " in text.lower():
-                    parts = re.split(r'\s+by\s+', text, 1, re.IGNORECASE)
-                    result["title"] = parts[0].strip()
-                    result["artist"] = parts[1].strip() if len(parts) > 1 else ""
         except Exception:
             pass
         return result
 
     def enrich_with_musicbrainz(self, search_query: str) -> dict:
-        """MusicBrainz fallback - fixes title, artist, album & thumbnail"""
-        if not search_query or search_query.strip() == "":
+        """MusicBrainz + Cover Art Archive fallback"""
+        if not search_query.strip():
             return {}
-
         try:
-            # MusicBrainz requires proper User-Agent
             headers = {"User-Agent": f"AmazonMusicBot/1.0[](https://t.me/{DEV_USERNAME.strip('@')})"}
             url = f"https://musicbrainz.org/ws/2/recording?query={search_query}&fmt=json&limit=1"
             r = self.session.get(url, headers=headers, timeout=10)
@@ -131,8 +142,8 @@ class AmazonMusicDownloader:
         asin = self.extract_asin(amazon_url)
         page_meta = self.scrape_amazon_page(amazon_url)
 
-        # MusicBrainz fallback if Amazon scrape is poor
-        if page_meta["artist"] in ("", "Unknown Artist") or page_meta["title"] == asin:
+        # MusicBrainz fallback if Amazon gave bad data
+        if not page_meta["title"] or page_meta["artist"] in ("", "Unknown Artist") or page_meta["title"] == asin:
             query = f"{page_meta.get('title','')} {page_meta.get('artist','')} {asin}".strip()
             mb_data = self.enrich_with_musicbrainz(query)
             if mb_data:
@@ -140,7 +151,7 @@ class AmazonMusicDownloader:
                     if mb_data.get(k):
                         page_meta[k] = mb_data[k]
 
-        # Fallback query using ASIN only if still bad
+        # Final safety net with ASIN only
         if page_meta["artist"] in ("", "Unknown Artist"):
             mb_data = self.enrich_with_musicbrainz(asin)
             if mb_data:
@@ -148,7 +159,7 @@ class AmazonMusicDownloader:
                     if mb_data.get(k):
                         page_meta[k] = mb_data[k]
 
-        # Get stream from AfkArxyz (Ultra HD)
+        # Get Ultra HD stream
         api_url = f"https://amzn.afkarxyz.qzz.io/api/track/{asin}?quality=uhd"
         r = self.session.get(api_url, timeout=30)
         if r.status_code != 200:
@@ -170,7 +181,6 @@ class AmazonMusicDownloader:
             "url": amazon_url,
         }
 
-    # ── Rest of methods (unchanged) ───────────────────────────────────────
     def detect_codec(self, file_path: str) -> dict:
         cmd = ["ffprobe", "-v", "quiet", "-select_streams", "a:0",
                "-show_entries", "stream=codec_name,bits_per_raw_sample,sample_rate",
@@ -259,7 +269,7 @@ async def cmd_start(client: Client, message: Message):
 
     await message.reply_text(
         "<blockquote>👋 Amazon Music Downloader Ready!</blockquote>\n\n"
-        "Send any <b>track</b>, <b>album</b> or <b>playlist</b> link.\n"
+        "Send any track/album/playlist link.\n"
         "Auto Ultra HD + MusicBrainz metadata + Cover Art.\n\n"
         "<blockquote>Paste link below ⬇️</blockquote>",
         parse_mode=ParseMode.HTML,
@@ -272,7 +282,7 @@ async def cb_credits(client: Client, cb: CallbackQuery):
     await cb.answer()
     await cb.message.reply_text(
         "<blockquote>🏅 Credits</blockquote>\n\n"
-        "Built with ❤️ using Pyrogram + FFmpeg + AfkArxyz + MusicBrainz API\n\n"
+        "Built with ❤️ using Pyrogram + FFmpeg + AfkArxyz + MusicBrainz\n\n"
         f"<blockquote>Made by {DEV_USERNAME}</blockquote>",
         parse_mode=ParseMode.HTML,
     )
@@ -331,7 +341,6 @@ async def handle_url(client: Client, message: Message):
 
         else:  # album or playlist
             page_meta = downloader.scrape_amazon_page(text)
-            # MusicBrainz fallback for albums too
             if page_meta["artist"] in ("", "Unknown Artist"):
                 query = f"{page_meta.get('title','')} {page_meta.get('artist','')}"
                 mb = downloader.enrich_with_musicbrainz(query)
@@ -373,5 +382,5 @@ async def cb_dismiss(client: Client, cb: CallbackQuery):
 
 
 if __name__ == "__main__":
-    print("🎵 Amazon Music Bot started… (MusicBrainz + Ultra HD)")
+    print("🎵 Amazon Music Bot started… (fixed parser + MusicBrainz)")
     app.run()
