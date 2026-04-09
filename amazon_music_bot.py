@@ -44,14 +44,10 @@ class AmazonMusicDownloader:
     def extract_asin(self, amazon_url: str) -> str:
         parsed = urlparse(amazon_url)
         qs = parse_qs(parsed.query)
-
-        # Prefer trackAsin= from album links
         if "trackAsin" in qs and qs["trackAsin"]:
             track_asin = qs["trackAsin"][0]
             if re.match(r'^B[0-9A-Z]{9}$', track_asin):
                 return track_asin
-
-        # Fallback to path
         match = re.search(r'(B[0-9A-Z]{9})', parsed.path or amazon_url)
         if not match:
             raise Exception("Couldn't find a valid ASIN in the URL.")
@@ -73,7 +69,7 @@ class AmazonMusicDownloader:
             r = self.session.get(amazon_url, timeout=15)
             html = r.text
 
-            # 1. og:meta tags
+            # og:meta
             for attr in ("property", "name"):
                 for tag, key in [("og:title", "title"), ("og:image", "thumbnail"), ("music:musician", "artist")]:
                     m = re.search(
@@ -83,15 +79,20 @@ class AmazonMusicDownloader:
                     if m and not result.get(key):
                         result[key] = m.group(1).strip()
 
-            # 2. STRONG FALLBACK: <title> tag (this is what finally fixes "Unknown Artist")
+            # Strong <title> tag parser (fixes "Unknown Artist" on albums)
             title_tag = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
             if title_tag and not result["title"]:
                 title_text = title_tag.group(1).strip()
                 if " on Amazon Music" in title_text:
-                    title_text = title_text.split(" on Amazon Music")[0]
+                    title_text = title_text.split(" on Amazon Music")[0].strip()
 
-                # Format: "Attention song by Charlie Puth from Voicenotes"
-                if " song by " in title_text.lower():
+                # Album format: "Voicenotes by Charlie Puth"
+                if " by " in title_text.lower():
+                    parts = re.split(r'\s+by\s+', title_text, 1, re.IGNORECASE)
+                    result["title"] = parts[0].strip()
+                    result["artist"] = parts[1].strip() if len(parts) > 1 else ""
+                # Track format fallback
+                elif " song by " in title_text.lower():
                     parts = re.split(r'\s+song by\s+', title_text, 1, re.IGNORECASE)
                     result["title"] = parts[0].strip()
                     if len(parts) == 2:
@@ -103,20 +104,7 @@ class AmazonMusicDownloader:
                         else:
                             result["artist"] = remaining.strip()
 
-                # Album/Playlist format
-                elif " by " in title_text.lower():
-                    parts = re.split(r'\s+by\s+', title_text, 1, re.IGNORECASE)
-                    if len(parts) == 2:
-                        result["title"] = parts[0].strip()   # Album/Playlist name
-                        result["artist"] = parts[1].strip()
-
-                # Simple "Title - Artist"
-                elif " - " in title_text:
-                    parts = title_text.split(" - ", 1)
-                    result["title"] = parts[0].strip()
-                    result["artist"] = parts[1].strip()
-
-            # 3. JSON-LD (backup)
+            # JSON-LD backup
             for ld_raw in re.findall(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', html, re.DOTALL):
                 try:
                     ld = json.loads(ld_raw)
@@ -164,7 +152,6 @@ class AmazonMusicDownloader:
             "url": amazon_url,
         }
 
-    # ... (download, detect_codec, download_thumbnail stay exactly the same as previous version)
     def detect_codec(self, file_path: str) -> dict:
         cmd = ["ffprobe", "-v", "quiet", "-select_streams", "a:0",
                "-show_entries", "stream=codec_name,bits_per_raw_sample,sample_rate",
@@ -176,7 +163,6 @@ class AmazonMusicDownloader:
         return data.get("streams", [{}])[0]
 
     def download(self, meta: dict, output_dir: str = DOWNLOAD_DIR) -> dict:
-        # (same as last version - unchanged)
         asin = meta["asin"]
         stream_url = meta["stream_url"]
         key = meta["key"]
@@ -262,8 +248,8 @@ async def cmd_start(client: Client, message: Message):
     await message.reply_text(
         "<blockquote>👋 Amazon Music Downloader Ready!</blockquote>\n\n"
         "Send any <b>track</b>, <b>album</b> or <b>playlist</b> link.\n\n"
-        "✅ Tracks → full download (HD / Ultra HD)\n"
-        "✅ Albums & Playlists → metadata + thumbnail shown\n\n"
+        "✅ Tracks → HD / Ultra HD download\n"
+        "✅ Albums & Playlists → full metadata + thumbnail\n\n"
         "<blockquote>Paste link below ⬇️</blockquote>",
         parse_mode=ParseMode.HTML,
         reply_markup=buttons,
@@ -282,7 +268,7 @@ async def cb_credits(client: Client, cb: CallbackQuery):
     )
 
 
-# ── URL Handler ───────────────────────────────────────────────────────────────
+# ── URL Handler (FIXED) ───────────────────────────────────────────────────────
 @app.on_message(filters.text & ~filters.command(["start"]))
 async def handle_url(client: Client, message: Message):
     text = message.text.strip()
@@ -295,10 +281,16 @@ async def handle_url(client: Client, message: Message):
 
     try:
         loop = asyncio.get_event_loop()
+        asin = downloader.extract_asin(text)          # ← always extract first
 
         if url_type == "track":
             meta = await loop.run_in_executor(None, downloader.fetch_metadata, text, "hd")
-            asin = meta["asin"]
+            page_meta = {                                 # reuse for thumbnail
+                "title": meta["title"],
+                "artist": meta["artist"],
+                "album": meta["album"],
+                "thumbnail": meta["thumbnail"]
+            }
             key_hd = f"{asin}_hd_{message.id}"
             key_uhd = f"{asin}_uhd_{message.id}"
 
@@ -322,21 +314,19 @@ async def handle_url(client: Client, message: Message):
 
         else:  # album or playlist
             page_meta = downloader.scrape_amazon_page(text)
-            asin = downloader.extract_asin(text)
             info_text = (
                 f"<blockquote>📀 {url_type.capitalize()} Found!</blockquote>\n\n"
                 f"<b>{page_meta.get('title') or 'Album/Playlist'}</b>\n"
                 f"👤 {page_meta.get('artist') or 'Unknown Artist'}\n"
                 + (f"💿 {page_meta.get('album') or ''}\n" if page_meta.get('album') else "")
                 + "\n<blockquote>Multi-track download coming soon™</blockquote>\n"
-                f"<i>Send individual track links for full download.</i>"
+                f"<i>Send individual track links for now.</i>"
             )
-            buttons = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Got it", callback_data="dismiss")
-            ]])
+            buttons = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Got it", callback_data="dismiss")]])
 
+        # Thumbnail (now safe in both branches)
         thumb_path = await loop.run_in_executor(
-            None, downloader.download_thumbnail, page_meta.get("thumbnail") or meta.get("thumbnail", ""), asin
+            None, downloader.download_thumbnail, page_meta.get("thumbnail", ""), asin
         )
 
         await status.delete()
@@ -352,10 +342,9 @@ async def handle_url(client: Client, message: Message):
         await status.edit_text(f"<blockquote>❌ Error</blockquote>\n\n<code>{e}</code>", parse_mode=ParseMode.HTML)
 
 
-# ── Download callback (only for tracks) ───────────────────────────────────────
+# ── Download callback ─────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^dl:"))
 async def cb_download(client: Client, cb: CallbackQuery):
-    # (exactly the same as previous working version - unchanged)
     await cb.answer("Starting download…")
     track_key = cb.data[3:]
     meta = pending_tracks.get(track_key)
@@ -432,5 +421,5 @@ async def cb_cancel(client: Client, cb: CallbackQuery):
 
 
 if __name__ == "__main__":
-    print("🎵 Amazon Music Bot started… (with playlist/album support)")
+    print("🎵 Amazon Music Bot started… (album + playlist support)")
     app.run()
