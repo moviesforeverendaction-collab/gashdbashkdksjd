@@ -59,12 +59,95 @@ class AmazonMusicDownloader:
             raise Exception("ffprobe found no audio streams")
         return streams[0]
 
-    def fetch_metadata(self, amazon_url: str, quality: str = "hd") -> dict:
-        """Fetch track metadata + stream info without downloading."""
-        asin    = self.extract_asin(amazon_url)
-        # quality param: 'hd' → CD quality, 'uhd' → Hi-Res
-        api_url = f"https://amzn.afkarxyz.qzz.io/api/track/{asin}?quality={quality}"
+    def scrape_amazon_page(self, amazon_url: str) -> dict:
+        """Scrape title, artist, album, thumbnail from Amazon Music page og:/ld+json tags."""
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        result = {"title": "", "artist": "", "album": "", "thumbnail": ""}
+        try:
+            r = self.session.get(amazon_url, headers=headers, timeout=15)
+            html = r.text
 
+            # ── og: meta tags ──────────────────────────────────────────────
+            for attr in ("property", "name"):
+                for tag, key in [
+                    ("og:title",       "title"),
+                    ("og:image",       "thumbnail"),
+                    ("music:musician", "artist"),
+                    ("og:description", "_desc"),
+                ]:
+                    m = re.search(
+                        rf'<meta[^>]+{attr}=["\\'\']{re.escape(tag)}["\\'\']\s[^>]+content=["\\'\'](.*?)["\\'\']\s*/?>', html
+                    )
+                    if not m:
+                        m = re.search(
+                            rf'<meta[^>]+content=["\\'\'](.*?)["\\\']\s[^>]+{attr}=["\\'\']{re.escape(tag)}["\\'\']\s*/?>', html
+                        )
+                    if m and not result.get(key, ""):
+                        result[key] = m.group(1).strip()
+
+            # ── JSON-LD ────────────────────────────────────────────────────
+            for ld_raw in re.findall(
+                r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                html, re.DOTALL
+            ):
+                try:
+                    ld = json.loads(ld_raw)
+                    if not result["title"]:
+                        result["title"] = ld.get("name", "")
+                    if not result["thumbnail"]:
+                        result["thumbnail"] = ld.get("image", "")
+                    if not result["album"]:
+                        in_album = ld.get("inAlbum", {})
+                        result["album"] = (
+                            in_album.get("name", "") if isinstance(in_album, dict)
+                            else ""
+                        )
+                    if not result["artist"]:
+                        by_artist = ld.get("byArtist", {})
+                        if isinstance(by_artist, list) and by_artist:
+                            by_artist = by_artist[0]
+                        result["artist"] = by_artist.get("name", "") if isinstance(by_artist, dict) else ""
+                except Exception:
+                    pass
+
+            # ── title cleanup: "Song – Artist | Amazon Music" → "Song" ────
+            if " | " in result["title"]:
+                result["title"] = result["title"].split(" | ")[0].strip()
+            # Some pages: "Song - Artist" in og:title
+            if result["title"] and " - " in result["title"] and not result["artist"]:
+                parts = result["title"].split(" - ", 1)
+                result["title"]  = parts[0].strip()
+                result["artist"] = parts[1].strip()
+            elif result["title"] and " – " in result["title"] and not result["artist"]:
+                parts = result["title"].split(" – ", 1)
+                result["title"]  = parts[0].strip()
+                result["artist"] = parts[1].strip()
+
+        except Exception:
+            pass
+        return result
+
+    def fetch_metadata(self, amazon_url: str, quality: str = "hd") -> dict:
+        """Fetch track metadata + stream info.
+        Strategy:
+          1. Scrape the Amazon Music page for title/artist/album/thumbnail (reliable).
+          2. Call AfkArxyz API for streamUrl + decryptionKey.
+          3. Merge — page data wins for display fields, API data for stream/key.
+        """
+        asin = self.extract_asin(amazon_url)
+
+        # ── Step 1: scrape Amazon page for display metadata ────────────────
+        page_meta = self.scrape_amazon_page(amazon_url)
+
+        # ── Step 2: call AfkArxyz API for stream + key ─────────────────────
+        api_url = f"https://amzn.afkarxyz.qzz.io/api/track/{asin}?quality={quality}"
         r = self.session.get(api_url, timeout=30)
         if r.status_code == 404:
             raise Exception("Track not found — this ASIN might be an album, not a single track.")
@@ -72,15 +155,38 @@ class AmazonMusicDownloader:
             raise Exception(f"API error — HTTP {r.status_code}")
 
         data = r.json()
+
+        # ── Step 3: pull every possible field name the API might use ───────
+        def _first(*keys):
+            for k in keys:
+                v = data.get(k)
+                if v and str(v).strip():
+                    return str(v).strip()
+            return ""
+
+        api_title     = _first("title", "trackTitle", "songTitle", "name", "track_title")
+        api_artist    = _first("artist", "artistName", "artistNames", "performer", "performers", "artist_name")
+        api_album     = _first("album",  "albumTitle", "albumName",  "album_title")
+        api_thumbnail = _first("imageUrl", "artworkUrl", "albumArtUrl", "coverArt",
+                               "thumbnail", "image", "cover", "artwork")
+        stream_url    = _first("streamUrl", "stream_url", "url", "audioUrl", "audio_url")
+        key           = _first("decryptionKey", "decryption_key", "key", "encKey")
+
+        # Page scrape wins for display fields (more reliable); API fills gaps
+        title     = page_meta.get("title")     or api_title     or asin
+        artist    = page_meta.get("artist")    or api_artist    or "Unknown Artist"
+        album     = page_meta.get("album")     or api_album     or ""
+        thumbnail = page_meta.get("thumbnail") or api_thumbnail or ""
+
         return {
             "asin":       asin,
-            "title":      data.get("title") or asin,
-            "artist":     data.get("artist") or "Unknown Artist",
-            "album":      data.get("album") or "",
-            "duration":   data.get("duration") or 0,
-            "thumbnail":  data.get("imageUrl") or data.get("thumbnail") or data.get("image") or "",
-            "stream_url": data.get("streamUrl") or "",
-            "key":        data.get("decryptionKey") or "",
+            "title":      title,
+            "artist":     artist,
+            "album":      album,
+            "duration":   data.get("duration") or data.get("durationMillis", 0) // 1000 if data.get("durationMillis") else data.get("duration") or 0,
+            "thumbnail":  thumbnail,
+            "stream_url": stream_url,
+            "key":        key,
             "quality":    quality,
             "url":        amazon_url,
         }
@@ -370,11 +476,14 @@ async def cb_download(client: Client, cb: CallbackQuery):
     try:
         loop = asyncio.get_event_loop()
 
-        # If quality differs from what was fetched, re-fetch with correct quality
-        if quality != meta.get("quality_fetched", "hd"):
-            meta = await loop.run_in_executor(
-                None, downloader.fetch_metadata, user_url, quality
+        # Always re-fetch for UHD so we get the correct stream URL for that quality
+        if quality == "uhd":
+            uhd_meta = await loop.run_in_executor(
+                None, downloader.fetch_metadata, user_url, "uhd"
             )
+            # Keep scraped display fields, only swap stream/key for UHD
+            meta = {**meta, "stream_url": uhd_meta["stream_url"],
+                    "key": uhd_meta["key"], "quality": "uhd"}
 
         result = await loop.run_in_executor(None, downloader.download, meta)
 
