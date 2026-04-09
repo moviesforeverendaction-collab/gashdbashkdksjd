@@ -24,18 +24,12 @@ DEV_URL       = os.getenv("DEV_URL", "https://t.me/yourdev")
 DOWNLOAD_DIR = "./downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-pending_tracks: dict[str, dict] = {}
-
 # ── Downloader ────────────────────────────────────────────────────────────────
 class AmazonMusicDownloader:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/134.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://music.amazon.in/",
@@ -50,7 +44,7 @@ class AmazonMusicDownloader:
                 return track_asin
         match = re.search(r'(B[0-9A-Z]{9})', parsed.path or amazon_url)
         if not match:
-            raise Exception("Couldn't find a valid ASIN in the URL.")
+            raise Exception("No valid track ID found in the link.")
         return match.group(1)
 
     def get_url_type(self, url: str) -> str:
@@ -60,7 +54,7 @@ class AmazonMusicDownloader:
             return "album"
         elif "/playlists/" in url:
             return "playlist"
-        return "track"
+        return "unknown"
 
     def scrape_amazon_page(self, amazon_url: str) -> dict:
         result = {"title": "", "artist": "", "album": "", "thumbnail": ""}
@@ -72,28 +66,23 @@ class AmazonMusicDownloader:
             # og:meta
             for attr in ("property", "name"):
                 for tag, key in [("og:title", "title"), ("og:image", "thumbnail"), ("music:musician", "artist")]:
-                    m = re.search(
-                        rf'<meta[^>]+{attr}=["\']{re.escape(tag)}["\'][^>]*content=["\'](.*?)["\']',
-                        html, re.IGNORECASE
-                    )
+                    m = re.search(rf'<meta[^>]+{attr}=["\']{re.escape(tag)}["\'][^>]*content=["\'](.*?)["\']', html, re.IGNORECASE)
                     if m and not result.get(key):
                         result[key] = m.group(1).strip()
 
-            # Strong <title> tag parser (fixes "Unknown Artist" on albums)
+            # Strong <title> fallback (fixes most "Unknown Artist" cases)
             title_tag = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
             if title_tag and not result["title"]:
-                title_text = title_tag.group(1).strip()
-                if " on Amazon Music" in title_text:
-                    title_text = title_text.split(" on Amazon Music")[0].strip()
+                text = title_tag.group(1).strip()
+                if " on Amazon Music" in text:
+                    text = text.split(" on Amazon Music")[0].strip()
 
-                # Album format: "Voicenotes by Charlie Puth"
-                if " by " in title_text.lower():
-                    parts = re.split(r'\s+by\s+', title_text, 1, re.IGNORECASE)
+                if " by " in text.lower():
+                    parts = re.split(r'\s+by\s+', text, 1, re.IGNORECASE)
                     result["title"] = parts[0].strip()
                     result["artist"] = parts[1].strip() if len(parts) > 1 else ""
-                # Track format fallback
-                elif " song by " in title_text.lower():
-                    parts = re.split(r'\s+song by\s+', title_text, 1, re.IGNORECASE)
+                elif " song by " in text.lower():
+                    parts = re.split(r'\s+song by\s+', text, 1, re.IGNORECASE)
                     result["title"] = parts[0].strip()
                     if len(parts) == 2:
                         remaining = parts[1]
@@ -123,14 +112,14 @@ class AmazonMusicDownloader:
 
         except Exception:
             pass
-
         return result
 
-    def fetch_metadata(self, amazon_url: str, quality: str = "hd") -> dict:
+    def fetch_metadata(self, amazon_url: str) -> dict:
         asin = self.extract_asin(amazon_url)
         page_meta = self.scrape_amazon_page(amazon_url)
 
-        api_url = f"https://amzn.afkarxyz.qzz.io/api/track/{asin}?quality={quality}"
+        # Always Ultra HD now
+        api_url = f"https://amzn.afkarxyz.qzz.io/api/track/{asin}?quality=uhd"
         r = self.session.get(api_url, timeout=30)
         if r.status_code != 200:
             raise Exception(f"API error — HTTP {r.status_code}")
@@ -148,7 +137,6 @@ class AmazonMusicDownloader:
             "thumbnail": page_meta.get("thumbnail") or "",
             "stream_url": stream_url,
             "key": key,
-            "quality": quality,
             "url": amazon_url,
         }
 
@@ -162,7 +150,7 @@ class AmazonMusicDownloader:
         data = json.loads(result.stdout)
         return data.get("streams", [{}])[0]
 
-    def download(self, meta: dict, output_dir: str = DOWNLOAD_DIR) -> dict:
+    def download(self, meta: dict) -> dict:
         asin = meta["asin"]
         stream_url = meta["stream_url"]
         key = meta["key"]
@@ -172,8 +160,8 @@ class AmazonMusicDownloader:
         if not stream_url:
             raise Exception("No stream URL found.")
 
-        os.makedirs(output_dir, exist_ok=True)
-        temp_file = os.path.join(output_dir, f"{asin}_enc.m4a")
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        temp_file = os.path.join(DOWNLOAD_DIR, f"{asin}_enc.m4a")
 
         with self.session.get(stream_url, stream=True, timeout=120) as resp:
             resp.raise_for_status()
@@ -183,14 +171,14 @@ class AmazonMusicDownloader:
         safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}")
 
         if not key:
-            final_file = os.path.join(output_dir, f"{safe_name}.m4a")
+            final_file = os.path.join(DOWNLOAD_DIR, f"{safe_name}.m4a")
             os.rename(temp_file, final_file)
             return {**meta, "file_path": final_file, "codec": "m4a"}
 
         stream_info = self.detect_codec(temp_file)
         codec = stream_info.get("codec_name", "flac")
         ext = "flac" if codec == "flac" else "m4a"
-        final_file = os.path.join(output_dir, f"{safe_name}.{ext}")
+        final_file = os.path.join(DOWNLOAD_DIR, f"{safe_name}.{ext}")
 
         cmd = ["ffmpeg", "-loglevel", "error", "-decryption_key", key.strip(),
                "-i", temp_file, "-c", "copy", "-y", final_file]
@@ -229,13 +217,6 @@ AMAZON_MUSIC_RE = re.compile(r'https?://music\.amazon\.(in|com|co\.uk|de|jp|fr|c
 def is_amazon_music_url(text: str) -> bool:
     return bool(AMAZON_MUSIC_RE.search(text))
 
-def quality_label(quality: str) -> str:
-    return "🌟 Ultra HD — 24-bit / 192 kHz" if quality == "uhd" else "💿 HD — 16-bit / 44.1 kHz"
-
-def fmt_duration(secs: int) -> str:
-    m, s = divmod(int(secs), 60)
-    return f"{m}:{s:02d}"
-
 
 # ── /start ────────────────────────────────────────────────────────────────────
 @app.on_message(filters.command("start"))
@@ -247,16 +228,14 @@ async def cmd_start(client: Client, message: Message):
 
     await message.reply_text(
         "<blockquote>👋 Amazon Music Downloader Ready!</blockquote>\n\n"
-        "Send any <b>track</b>, <b>album</b> or <b>playlist</b> link.\n\n"
-        "✅ Tracks → HD / Ultra HD download\n"
-        "✅ Albums & Playlists → full metadata + thumbnail\n\n"
+        "Just send any <b>track</b>, <b>album</b> or <b>playlist</b> link.\n"
+        "I will auto-download in <b>Ultra HD</b> (24-bit / 192 kHz).\n\n"
         "<blockquote>Paste link below ⬇️</blockquote>",
         parse_mode=ParseMode.HTML,
         reply_markup=buttons,
     )
 
 
-# ── Credits ───────────────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex("^show_credits$"))
 async def cb_credits(client: Client, cb: CallbackQuery):
     await cb.answer()
@@ -268,7 +247,7 @@ async def cb_credits(client: Client, cb: CallbackQuery):
     )
 
 
-# ── URL Handler (FIXED) ───────────────────────────────────────────────────────
+# ── Main Handler ──────────────────────────────────────────────────────────────
 @app.on_message(filters.text & ~filters.command(["start"]))
 async def handle_url(client: Client, message: Message):
     text = message.text.strip()
@@ -276,41 +255,52 @@ async def handle_url(client: Client, message: Message):
         await message.reply_text("<blockquote>❌ Not an Amazon Music link.</blockquote>", parse_mode=ParseMode.HTML)
         return
 
+    # Block search & api links
+    if "/search/" in text.lower() or "/api/" in text.lower():
+        await message.reply_text(
+            "<blockquote>🔍 Search or API links are not supported.</blockquote>\n\n"
+            "Please send a <b>direct track</b>, <b>album</b> or <b>playlist</b> link.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
     url_type = downloader.get_url_type(text)
     status = await message.reply_text("🔍 Fetching details…", parse_mode=ParseMode.HTML)
 
     try:
         loop = asyncio.get_event_loop()
-        asin = downloader.extract_asin(text)          # ← always extract first
+        asin = downloader.extract_asin(text)
 
         if url_type == "track":
-            meta = await loop.run_in_executor(None, downloader.fetch_metadata, text, "hd")
-            page_meta = {                                 # reuse for thumbnail
-                "title": meta["title"],
-                "artist": meta["artist"],
-                "album": meta["album"],
-                "thumbnail": meta["thumbnail"]
-            }
-            key_hd = f"{asin}_hd_{message.id}"
-            key_uhd = f"{asin}_uhd_{message.id}"
+            # Direct Ultra HD download (no quality selector)
+            meta = await loop.run_in_executor(None, downloader.fetch_metadata, text)
+            result = await loop.run_in_executor(None, downloader.download, meta)
 
-            pending_tracks[key_hd] = {**meta, "quality": "hd", "user_url": text}
-            pending_tracks[key_uhd] = {**meta, "quality": "uhd", "user_url": text}
-
-            info_text = (
-                f"<blockquote>🎵 Track Found!</blockquote>\n\n"
-                f"<b>{meta['title']}</b>\n"
-                f"👤 {meta['artist']}\n"
-                + (f"💿 {meta['album']}\n" if meta['album'] else "")
-                + (f"⏱ {fmt_duration(meta['duration'])}\n" if meta['duration'] else "")
-                + "\n<blockquote>Pick quality below 👇</blockquote>"
+            # Thumbnail
+            thumb_path = await loop.run_in_executor(
+                None, downloader.download_thumbnail, meta["thumbnail"], asin
             )
 
-            buttons = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💿 HD • 16-bit / 44.1 kHz", callback_data=f"dl:{key_hd}", style=ButtonStyle.SUCCESS)],
-                [InlineKeyboardButton("🌟 Ultra HD • 24-bit / 192 kHz", callback_data=f"dl:{key_uhd}", style=ButtonStyle.PRIMARY)],
-                [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{message.id}", style=ButtonStyle.DANGER)],
-            ])
+            await status.edit_text(f"📤 Uploading <b>{result['title']}</b>…", parse_mode=ParseMode.HTML)
+
+            caption = (
+                f"<blockquote>🎵 {result['title']}</blockquote>\n\n"
+                f"👤 <b>Artist:</b> {result['artist']}\n"
+                + (f"💿 <b>Album:</b> {result['album']}\n" if result['album'] else "")
+                + f"🎚 <b>Format:</b> {result['codec'].upper()}\n"
+                f"✨ <b>Quality:</b> 🌟 Ultra HD — 24-bit / 192 kHz"
+            )
+
+            await message.reply_audio(
+                audio=result["file_path"],
+                caption=caption,
+                title=result["title"],
+                performer=result["artist"],
+                thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
+                parse_mode=ParseMode.HTML,
+            )
+
+            await status.delete()
 
         else:  # album or playlist
             page_meta = downloader.scrape_amazon_page(text)
@@ -320,99 +310,29 @@ async def handle_url(client: Client, message: Message):
                 f"👤 {page_meta.get('artist') or 'Unknown Artist'}\n"
                 + (f"💿 {page_meta.get('album') or ''}\n" if page_meta.get('album') else "")
                 + "\n<blockquote>Multi-track download coming soon™</blockquote>\n"
-                f"<i>Send individual track links for now.</i>"
+                f"<i>Send individual track links for full download.</i>"
             )
             buttons = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Got it", callback_data="dismiss")]])
 
-        # Thumbnail (now safe in both branches)
-        thumb_path = await loop.run_in_executor(
-            None, downloader.download_thumbnail, page_meta.get("thumbnail", ""), asin
-        )
+            thumb_path = await loop.run_in_executor(
+                None, downloader.download_thumbnail, page_meta.get("thumbnail", ""), asin
+            )
 
-        await status.delete()
+            await status.delete()
 
-        if thumb_path and os.path.exists(thumb_path):
-            await message.reply_photo(photo=thumb_path, caption=info_text, parse_mode=ParseMode.HTML, reply_markup=buttons)
-            try: os.remove(thumb_path)
-            except: pass
-        else:
-            await message.reply_text(info_text, parse_mode=ParseMode.HTML, reply_markup=buttons)
+            if thumb_path and os.path.exists(thumb_path):
+                await message.reply_photo(photo=thumb_path, caption=info_text, parse_mode=ParseMode.HTML, reply_markup=buttons)
+                try: os.remove(thumb_path)
+                except: pass
+            else:
+                await message.reply_text(info_text, parse_mode=ParseMode.HTML, reply_markup=buttons)
 
     except Exception as e:
         await status.edit_text(f"<blockquote>❌ Error</blockquote>\n\n<code>{e}</code>", parse_mode=ParseMode.HTML)
 
 
-# ── Download callback ─────────────────────────────────────────────────────────
-@app.on_callback_query(filters.regex(r"^dl:"))
-async def cb_download(client: Client, cb: CallbackQuery):
-    await cb.answer("Starting download…")
-    track_key = cb.data[3:]
-    meta = pending_tracks.get(track_key)
-    if not meta:
-        await cb.message.edit_caption("<blockquote>⚠️ Request expired.</blockquote>", parse_mode=ParseMode.HTML)
-        return
-
-    quality = meta["quality"]
-    q_label = quality_label(quality)
-
-    try:
-        await cb.message.edit_reply_markup(reply_markup=None)
-    except:
-        pass
-
-    status = await cb.message.reply_text(f"⏳ Downloading <b>{q_label}</b>…", parse_mode=ParseMode.HTML)
-
-    result = None
-    thumb_path = None
-    try:
-        loop = asyncio.get_event_loop()
-        if quality == "uhd":
-            uhd_meta = await loop.run_in_executor(None, downloader.fetch_metadata, meta["user_url"], "uhd")
-            meta = {**meta, "stream_url": uhd_meta["stream_url"], "key": uhd_meta["key"], "quality": "uhd"}
-
-        result = await loop.run_in_executor(None, downloader.download, meta)
-
-        if meta.get("thumbnail"):
-            thumb_path = await loop.run_in_executor(None, downloader.download_thumbnail, meta["thumbnail"], meta["asin"])
-
-        await status.edit_text(f"📤 Uploading <b>{result['title']}</b>…", parse_mode=ParseMode.HTML)
-
-        caption = (
-            f"<blockquote>🎵 {result['title']}</blockquote>\n\n"
-            f"👤 <b>Artist:</b> {result['artist']}\n"
-            + (f"💿 <b>Album:</b> {result['album']}\n" if result['album'] else "")
-            + f"🎚 <b>Format:</b> {result['codec'].upper()}\n"
-            f"✨ <b>Quality:</b> {q_label}"
-        )
-
-        await cb.message.reply_audio(
-            audio=result["file_path"],
-            caption=caption,
-            title=result["title"],
-            performer=result["artist"],
-            thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
-            parse_mode=ParseMode.HTML,
-        )
-
-        await status.delete()
-
-        pending_tracks.pop(track_key, None)
-        other_key = track_key.replace(f"_{quality}_", f"_{'uhd' if quality == 'hd' else 'hd'}_")
-        pending_tracks.pop(other_key, None)
-
-    except Exception as e:
-        await status.edit_text(f"<blockquote>❌ Download failed</blockquote>\n\n<code>{e}</code>", parse_mode=ParseMode.HTML)
-    finally:
-        if result and result.get("file_path") and os.path.exists(result["file_path"]):
-            try: os.remove(result["file_path"])
-            except: pass
-        if thumb_path and os.path.exists(thumb_path):
-            try: os.remove(thumb_path)
-            except: pass
-
-
-@app.on_callback_query(filters.regex(r"^cancel:|^dismiss$"))
-async def cb_cancel(client: Client, cb: CallbackQuery):
+@app.on_callback_query(filters.regex(r"^dismiss$"))
+async def cb_dismiss(client: Client, cb: CallbackQuery):
     await cb.answer("Done ✅")
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
@@ -421,5 +341,5 @@ async def cb_cancel(client: Client, cb: CallbackQuery):
 
 
 if __name__ == "__main__":
-    print("🎵 Amazon Music Bot started… (album + playlist support)")
+    print("🎵 Amazon Music Bot started… (Ultra HD direct download)")
     app.run()
