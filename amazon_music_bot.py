@@ -29,7 +29,10 @@ class AmazonMusicDownloader:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+            ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://music.amazon.in/",
@@ -57,8 +60,8 @@ class AmazonMusicDownloader:
         return "unknown"
 
     def scrape_amazon_page(self, amazon_url: str) -> dict:
+        """Basic scrape (often fails due to JS)"""
         result = {"title": "", "artist": "", "album": "", "thumbnail": ""}
-
         try:
             r = self.session.get(amazon_url, timeout=15)
             html = r.text
@@ -70,55 +73,82 @@ class AmazonMusicDownloader:
                     if m and not result.get(key):
                         result[key] = m.group(1).strip()
 
-            # Strong <title> fallback (fixes most "Unknown Artist" cases)
+            # <title> tag fallback
             title_tag = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
             if title_tag and not result["title"]:
                 text = title_tag.group(1).strip()
                 if " on Amazon Music" in text:
                     text = text.split(" on Amazon Music")[0].strip()
-
                 if " by " in text.lower():
                     parts = re.split(r'\s+by\s+', text, 1, re.IGNORECASE)
                     result["title"] = parts[0].strip()
                     result["artist"] = parts[1].strip() if len(parts) > 1 else ""
-                elif " song by " in text.lower():
-                    parts = re.split(r'\s+song by\s+', text, 1, re.IGNORECASE)
-                    result["title"] = parts[0].strip()
-                    if len(parts) == 2:
-                        remaining = parts[1]
-                        if " from " in remaining.lower():
-                            sub = re.split(r'\s+from\s+', remaining, 1, re.IGNORECASE)
-                            result["artist"] = sub[0].strip()
-                            result["album"] = sub[1].strip() if len(sub) > 1 else ""
-                        else:
-                            result["artist"] = remaining.strip()
-
-            # JSON-LD backup
-            for ld_raw in re.findall(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', html, re.DOTALL):
-                try:
-                    ld = json.loads(ld_raw)
-                    if isinstance(ld, dict):
-                        if not result["title"]: result["title"] = ld.get("name", "")
-                        if not result["thumbnail"]: result["thumbnail"] = ld.get("image", "")
-                        if not result["album"]:
-                            album = ld.get("inAlbum") or ld.get("album")
-                            if isinstance(album, dict): result["album"] = album.get("name", "")
-                        if not result["artist"]:
-                            artist = ld.get("byArtist") or ld.get("artist")
-                            if isinstance(artist, list) and artist: artist = artist[0]
-                            if isinstance(artist, dict): result["artist"] = artist.get("name", "")
-                except:
-                    pass
-
         except Exception:
             pass
         return result
+
+    def enrich_with_musicbrainz(self, search_query: str) -> dict:
+        """MusicBrainz fallback - fixes title, artist, album & thumbnail"""
+        if not search_query or search_query.strip() == "":
+            return {}
+
+        try:
+            # MusicBrainz requires proper User-Agent
+            headers = {"User-Agent": f"AmazonMusicBot/1.0[](https://t.me/{DEV_USERNAME.strip('@')})"}
+            url = f"https://musicbrainz.org/ws/2/recording?query={search_query}&fmt=json&limit=1"
+            r = self.session.get(url, headers=headers, timeout=10)
+            if r.status_code != 200:
+                return {}
+
+            data = r.json()
+            recordings = data.get("recordings", [])
+            if not recordings:
+                return {}
+
+            rec = recordings[0]
+            title = rec.get("title", "")
+            artist = rec["artist-credit"][0]["artist"]["name"] if rec.get("artist-credit") else ""
+
+            album = ""
+            thumbnail = ""
+            if rec.get("releases"):
+                release = rec["releases"][0]
+                album = release.get("title", "")
+                mbid = release.get("id")
+                if mbid:
+                    thumbnail = f"https://coverartarchive.org/release/{mbid}/front-500"
+
+            return {
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "thumbnail": thumbnail
+            }
+        except Exception:
+            return {}
 
     def fetch_metadata(self, amazon_url: str) -> dict:
         asin = self.extract_asin(amazon_url)
         page_meta = self.scrape_amazon_page(amazon_url)
 
-        # Always Ultra HD now
+        # MusicBrainz fallback if Amazon scrape is poor
+        if page_meta["artist"] in ("", "Unknown Artist") or page_meta["title"] == asin:
+            query = f"{page_meta.get('title','')} {page_meta.get('artist','')} {asin}".strip()
+            mb_data = self.enrich_with_musicbrainz(query)
+            if mb_data:
+                for k in ["title", "artist", "album", "thumbnail"]:
+                    if mb_data.get(k):
+                        page_meta[k] = mb_data[k]
+
+        # Fallback query using ASIN only if still bad
+        if page_meta["artist"] in ("", "Unknown Artist"):
+            mb_data = self.enrich_with_musicbrainz(asin)
+            if mb_data:
+                for k in ["title", "artist", "album", "thumbnail"]:
+                    if mb_data.get(k):
+                        page_meta[k] = mb_data[k]
+
+        # Get stream from AfkArxyz (Ultra HD)
         api_url = f"https://amzn.afkarxyz.qzz.io/api/track/{asin}?quality=uhd"
         r = self.session.get(api_url, timeout=30)
         if r.status_code != 200:
@@ -140,6 +170,7 @@ class AmazonMusicDownloader:
             "url": amazon_url,
         }
 
+    # ── Rest of methods (unchanged) ───────────────────────────────────────
     def detect_codec(self, file_path: str) -> dict:
         cmd = ["ffprobe", "-v", "quiet", "-select_streams", "a:0",
                "-show_entries", "stream=codec_name,bits_per_raw_sample,sample_rate",
@@ -228,8 +259,8 @@ async def cmd_start(client: Client, message: Message):
 
     await message.reply_text(
         "<blockquote>👋 Amazon Music Downloader Ready!</blockquote>\n\n"
-        "Just send any <b>track</b>, <b>album</b> or <b>playlist</b> link.\n"
-        "I will auto-download in <b>Ultra HD</b> (24-bit / 192 kHz).\n\n"
+        "Send any <b>track</b>, <b>album</b> or <b>playlist</b> link.\n"
+        "Auto Ultra HD + MusicBrainz metadata + Cover Art.\n\n"
         "<blockquote>Paste link below ⬇️</blockquote>",
         parse_mode=ParseMode.HTML,
         reply_markup=buttons,
@@ -241,7 +272,7 @@ async def cb_credits(client: Client, cb: CallbackQuery):
     await cb.answer()
     await cb.message.reply_text(
         "<blockquote>🏅 Credits</blockquote>\n\n"
-        "Built with ❤️ using Pyrogram + FFmpeg + AfkArxyz API\n\n"
+        "Built with ❤️ using Pyrogram + FFmpeg + AfkArxyz + MusicBrainz API\n\n"
         f"<blockquote>Made by {DEV_USERNAME}</blockquote>",
         parse_mode=ParseMode.HTML,
     )
@@ -255,11 +286,10 @@ async def handle_url(client: Client, message: Message):
         await message.reply_text("<blockquote>❌ Not an Amazon Music link.</blockquote>", parse_mode=ParseMode.HTML)
         return
 
-    # Block search & api links
     if "/search/" in text.lower() or "/api/" in text.lower():
         await message.reply_text(
-            "<blockquote>🔍 Search or API links are not supported.</blockquote>\n\n"
-            "Please send a <b>direct track</b>, <b>album</b> or <b>playlist</b> link.",
+            "<blockquote>🔍 Search or API links not supported.</blockquote>\n"
+            "Please send a direct track/album/playlist link.",
             parse_mode=ParseMode.HTML
         )
         return
@@ -272,11 +302,9 @@ async def handle_url(client: Client, message: Message):
         asin = downloader.extract_asin(text)
 
         if url_type == "track":
-            # Direct Ultra HD download (no quality selector)
             meta = await loop.run_in_executor(None, downloader.fetch_metadata, text)
             result = await loop.run_in_executor(None, downloader.download, meta)
 
-            # Thumbnail
             thumb_path = await loop.run_in_executor(
                 None, downloader.download_thumbnail, meta["thumbnail"], asin
             )
@@ -299,18 +327,23 @@ async def handle_url(client: Client, message: Message):
                 thumb=thumb_path if thumb_path and os.path.exists(thumb_path) else None,
                 parse_mode=ParseMode.HTML,
             )
-
             await status.delete()
 
         else:  # album or playlist
             page_meta = downloader.scrape_amazon_page(text)
+            # MusicBrainz fallback for albums too
+            if page_meta["artist"] in ("", "Unknown Artist"):
+                query = f"{page_meta.get('title','')} {page_meta.get('artist','')}"
+                mb = downloader.enrich_with_musicbrainz(query)
+                if mb:
+                    page_meta.update(mb)
+
             info_text = (
                 f"<blockquote>📀 {url_type.capitalize()} Found!</blockquote>\n\n"
                 f"<b>{page_meta.get('title') or 'Album/Playlist'}</b>\n"
                 f"👤 {page_meta.get('artist') or 'Unknown Artist'}\n"
                 + (f"💿 {page_meta.get('album') or ''}\n" if page_meta.get('album') else "")
-                + "\n<blockquote>Multi-track download coming soon™</blockquote>\n"
-                f"<i>Send individual track links for full download.</i>"
+                + "\n<blockquote>Multi-track download coming soon™</blockquote>"
             )
             buttons = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Got it", callback_data="dismiss")]])
 
@@ -319,7 +352,6 @@ async def handle_url(client: Client, message: Message):
             )
 
             await status.delete()
-
             if thumb_path and os.path.exists(thumb_path):
                 await message.reply_photo(photo=thumb_path, caption=info_text, parse_mode=ParseMode.HTML, reply_markup=buttons)
                 try: os.remove(thumb_path)
@@ -341,5 +373,5 @@ async def cb_dismiss(client: Client, cb: CallbackQuery):
 
 
 if __name__ == "__main__":
-    print("🎵 Amazon Music Bot started… (Ultra HD direct download)")
+    print("🎵 Amazon Music Bot started… (MusicBrainz + Ultra HD)")
     app.run()
