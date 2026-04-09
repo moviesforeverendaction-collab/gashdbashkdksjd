@@ -1,23 +1,3 @@
-✅ **Patched & Fixed!**  
-I analyzed the screenshots + the full code + the current Amazon Music site behavior (as of April 2026).
-
-### What was broken:
-- **Wrong title / "Unknown Artist"**: The old `extract_asin` always took the **first** `B0...` code it found.  
-  When you send an **album link** (`/albums/B076667JCG?trackAsin=B07666K59B`), it grabbed the **album** ASIN instead of the actual track ASIN (`B07666K59B`).  
-  The AfkArxyz API no longer returns title/artist/thumbnail (only `streamUrl` + `decryptionKey`), and the page scraper was failing because Amazon Music is heavily JS-rendered.
-
-- **Thumbnail not showing**: No thumbnail URL → `download_thumbnail` returned `None` → bot fell back to plain text message instead of photo, and audio had no cover art.
-
-### Fixes applied:
-- New `extract_asin` now **prefers `trackAsin=`** query param (fixes album links) and falls back to path for `/tracks/` links.
-- Stronger browser headers + newer User-Agent in scraper.
-- Cleaner JSON-LD + og:meta parsing.
-- Removed `/help` command completely (as requested).
-- Minor cleanups for reliability.
-
-Here is the **full patched code** (copy-paste ready):
-
-```python
 import os
 import re
 import json
@@ -67,13 +47,11 @@ class AmazonMusicDownloader:
         parsed = urlparse(amazon_url)
         qs = parse_qs(parsed.query)
 
-        # Album links often contain ?trackAsin=...
         if "trackAsin" in qs and qs["trackAsin"]:
             track_asin = qs["trackAsin"][0]
             if re.match(r'^B[0-9A-Z]{9}$', track_asin):
                 return track_asin
 
-        # Normal /tracks/B0... links
         match = re.search(r'(B[0-9A-Z]{9})', parsed.path or amazon_url)
         if not match:
             raise Exception(
@@ -83,7 +61,7 @@ class AmazonMusicDownloader:
             )
         return match.group(1)
 
-    def detect_codec(self, file_path: str) -> str:
+    def detect_codec(self, file_path: str) -> dict:
         cmd = [
             "ffprobe", "-v", "quiet",
             "-select_streams", "a:0",
@@ -101,20 +79,19 @@ class AmazonMusicDownloader:
         return streams[0]
 
     def scrape_amazon_page(self, amazon_url: str) -> dict:
-        """Improved scraper for current Amazon Music pages."""
+        """Improved scraper for current Amazon Music pages (2026)."""
         result = {"title": "", "artist": "", "album": "", "thumbnail": ""}
 
         try:
             r = self.session.get(amazon_url, timeout=15)
             html = r.text
 
-            # ── og: meta tags (most reliable) ─────────────────────────────────
+            # og: meta tags
             for attr in ("property", "name"):
                 for tag, key in [
                     ("og:title", "title"),
                     ("og:image", "thumbnail"),
                     ("music:musician", "artist"),
-                    ("og:description", "_desc"),
                 ]:
                     m = re.search(
                         rf'<meta[^>]+{attr}=["\']{re.escape(tag)}["\'][^>]*content=["\'](.*?)["\']',
@@ -123,7 +100,7 @@ class AmazonMusicDownloader:
                     if m and not result.get(key):
                         result[key] = m.group(1).strip()
 
-            # ── JSON-LD (sometimes still present) ─────────────────────────────
+            # JSON-LD
             for ld_raw in re.findall(
                 r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
                 html, re.DOTALL
@@ -132,9 +109,9 @@ class AmazonMusicDownloader:
                     ld = json.loads(ld_raw)
                     if isinstance(ld, dict):
                         if not result["title"]:
-                            result["title"] = ld.get("name", "") or ld.get("@graph", [{}])[0].get("name", "")
+                            result["title"] = ld.get("name", "") or (ld.get("@graph", [{}])[0].get("name", "") if isinstance(ld.get("@graph"), list) else "")
                         if not result["thumbnail"]:
-                            result["thumbnail"] = ld.get("image", "") or ld.get("@graph", [{}])[0].get("image", "")
+                            result["thumbnail"] = ld.get("image", "") or (ld.get("@graph", [{}])[0].get("image", "") if isinstance(ld.get("@graph"), list) else "")
                         if not result["album"]:
                             album = ld.get("inAlbum") or ld.get("album")
                             if isinstance(album, dict):
@@ -148,7 +125,7 @@ class AmazonMusicDownloader:
                 except Exception:
                     pass
 
-            # ── Title cleanup ───────────────────────────────────────────────
+            # Title cleanup
             if " | " in result["title"]:
                 result["title"] = result["title"].split(" | ")[0].strip()
             if " - " in result["title"] and not result["artist"]:
@@ -168,10 +145,8 @@ class AmazonMusicDownloader:
     def fetch_metadata(self, amazon_url: str, quality: str = "hd") -> dict:
         asin = self.extract_asin(amazon_url)
 
-        # Step 1: Try page scrape (now more reliable)
         page_meta = self.scrape_amazon_page(amazon_url)
 
-        # Step 2: Get stream + key from AfkArxyz
         api_url = f"https://amzn.afkarxyz.qzz.io/api/track/{asin}?quality={quality}"
         r = self.session.get(api_url, timeout=30)
         if r.status_code != 200:
@@ -186,11 +161,9 @@ class AmazonMusicDownloader:
                     return str(v).strip()
             return ""
 
-        # API no longer returns metadata, so we only take stream/key
         stream_url = _first("streamUrl", "stream_url", "url", "audioUrl")
         key        = _first("decryptionKey", "decryption_key", "key", "encKey")
 
-        # Page data is now the main source
         return {
             "asin":       asin,
             "title":      page_meta.get("title") or asin,
@@ -261,6 +234,7 @@ class AmazonMusicDownloader:
         except Exception:
             return None
 
+
 downloader = AmazonMusicDownloader()
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
@@ -279,6 +253,7 @@ def quality_label(quality: str) -> str:
 def fmt_duration(secs: int) -> str:
     m, s = divmod(int(secs), 60)
     return f"{m}:{s:02d}"
+
 
 # ── /start ────────────────────────────────────────────────────────────────────
 @app.on_message(filters.command("start"))
@@ -302,6 +277,7 @@ async def cmd_start(client: Client, message: Message):
         reply_markup=buttons,
     )
 
+
 # ── Credits callback ──────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex("^show_credits$"))
 async def cb_credits(client: Client, cb: CallbackQuery):
@@ -315,6 +291,7 @@ async def cb_credits(client: Client, cb: CallbackQuery):
         f"<blockquote>Made by {DEV_USERNAME}</blockquote>",
         parse_mode=ParseMode.HTML,
     )
+
 
 # ── URL handler ───────────────────────────────────────────────────────────────
 @app.on_message(filters.text & ~filters.command(["start"]))
@@ -382,6 +359,7 @@ async def handle_url(client: Client, message: Message):
     except Exception as e:
         await status.edit_text(f"<blockquote>❌ Error</blockquote>\n\n<code>{e}</code>", parse_mode=ParseMode.HTML)
 
+
 # ── Quality selection → download ──────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^dl:"))
 async def cb_download(client: Client, cb: CallbackQuery):
@@ -413,7 +391,6 @@ async def cb_download(client: Client, cb: CallbackQuery):
 
         result = await loop.run_in_executor(None, downloader.download, meta)
 
-        # Re-download thumb for audio
         if meta.get("thumbnail"):
             thumb_path = await loop.run_in_executor(
                 None, downloader.download_thumbnail, meta["thumbnail"], meta["asin"]
@@ -440,7 +417,6 @@ async def cb_download(client: Client, cb: CallbackQuery):
 
         await status.delete()
 
-        # Cleanup pending
         pending_tracks.pop(track_key, None)
         other_key = track_key.replace(f"_{quality}_", f"_{'uhd' if quality == 'hd' else 'hd'}_")
         pending_tracks.pop(other_key, None)
@@ -460,6 +436,7 @@ async def cb_download(client: Client, cb: CallbackQuery):
             except Exception:
                 pass
 
+
 # ── Cancel callback ───────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^cancel:"))
 async def cb_cancel(client: Client, cb: CallbackQuery):
@@ -477,6 +454,7 @@ async def cb_cancel(client: Client, cb: CallbackQuery):
         )
     except Exception:
         pass
+
 
 if __name__ == "__main__":
     print("🎵 Amazon Music Bot started…")
