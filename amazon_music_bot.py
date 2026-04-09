@@ -83,11 +83,11 @@ class AmazonMusicDownloader:
                     ("og:description", "_desc"),
                 ]:
                     m = re.search(
-                        rf'<meta[^>]+{attr}=["\\'\']{re.escape(tag)}["\\'\']\s[^>]+content=["\\'\'](.*?)["\\'\']\s*/?>', html
+                        rf'<meta[^>]+{attr}=["\']{re.escape(tag)}["\']\s[^>]+content=["\'](.*?)["\']\s*/?>', html
                     )
                     if not m:
                         m = re.search(
-                            rf'<meta[^>]+content=["\\'\'](.*?)["\\\']\s[^>]+{attr}=["\\'\']{re.escape(tag)}["\\'\']\s*/?>', html
+                            rf'<meta[^>]+content=["\'](.*?)["\']\s[^>]+{attr}=["\']{re.escape(tag)}["\']\s*/?>', html
                         )
                     if m and not result.get(key, ""):
                         result[key] = m.group(1).strip()
