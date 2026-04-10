@@ -174,20 +174,35 @@ bot = Client("amzn_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 @bot.on_message(filters.command("start"))
 async def start(_, msg: Message):
     await msg.reply_text(
-        "send me an Amazon Music track link and i'll download it for you.\n\n"
-        "just paste it below.",
+        """<blockquote>
+<b>Hey 👋</b>
+<i>Send me an Amazon Music track link and I’ll download it for you.</i>
+
+<i>Just paste the link below.</i>
+</blockquote>""",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("developer", url=DEV_URL, style=ButtonStyle.PRIMARY),
-            InlineKeyboardButton("credits", callback_data="credits", style=ButtonStyle.SUCCESS),
+            InlineKeyboardButton("Dev", url=DEV_URL, style=ButtonStyle.PRIMARY),
+            InlineKeyboardButton("Credits", callback_data="credits", style=ButtonStyle.PRIMARY),
         ]]),
     )
-
 
 @bot.on_callback_query(filters.regex("^credits$"))
 async def credits_cb(_, cb: CallbackQuery):
     await cb.answer()
-    await cb.message.reply_text(f"pyrogram + ffmpeg + afkarxyz api\n\nby {DEV_USER}")
+    await cb.message.reply_text(
+        f"""
+<blockquote>
+<b>Credits</b>
 
+<i>This code was created by</i> <b>Nick</b> <i>and</i> <b>Abhi (tenka)</b>.
+
+<i>It’s just a small project built by</i> <b>Nick</b>,  
+<i>and thanks to his efforts, we can now enjoy a smooth music downloading experience.</i>
+
+<i>If you're using it and it helps you, just give proper credits that's all.</i> ❤️
+</blockquote>
+"""
+    )
 
 @bot.on_callback_query(filters.regex("^dismiss$"))
 async def dismiss_cb(_, cb: CallbackQuery):
