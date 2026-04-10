@@ -10,7 +10,7 @@ API_HASH  = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DEV_URL   = os.getenv("DEV_URL", "https://t.me/cantarella_wuwa")
 DEV_USER  = os.getenv("DEV_USERNAME", "@cantarella_wuwa")
-API_BASE  = os.getenv("API_BASE", "https://amzn.afkarxyz.qzz.io/api")
+API_BASE  = os.getenv("API_BASE", "")  #buy the api from the amazon (_:"":_)
 
 DL_DIR = "./downloads"
 os.makedirs(DL_DIR, exist_ok=True)
