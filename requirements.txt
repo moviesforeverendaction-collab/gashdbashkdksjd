@@ -2,3 +2,4 @@ kurigram
 TgCrypto
 requests
 asyncio
+httpx
