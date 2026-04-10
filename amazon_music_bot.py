@@ -176,7 +176,7 @@ async def start(_, msg: Message):
     await msg.reply_text(
         """<blockquote>
 <b>Hey 👋</b>
-<i>Send me an Amazon Music track link and I’ll download it for you.</i>
+<b>Send me an Amazon Music track link and I’ll download it for you.</b>
 
 <i>Just paste the link below.</i>
 </blockquote>""",
@@ -199,7 +199,7 @@ async def credits_cb(_, cb: CallbackQuery):
 <i>It’s just a small project built by</i> <b>Nick</b>,  
 <i>and thanks to his efforts, we can now enjoy a smooth music downloading experience.</i>
 
-<i>If you're using it and it helps you, just give proper credits that's all.</i> ❤️
+<i>If you're using it and it helps you, just give proper credits that's all.</i> 
 </blockquote>
 """
     )
